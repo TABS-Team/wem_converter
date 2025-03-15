@@ -522,8 +522,6 @@ impl WwiseRiffVorbis {
             self.generate_ogg_header(&mut ogg_stream, &mut mode_blockflag, &mut mode_bits)?;
         }
 
-        return Ok(());
-
         // Audio pages: start at the first audio packet offset.
         let mut offset = self.data_offset + self.first_audio_packet_offset as i64;
         while offset < self.data_offset + self.data_size {
