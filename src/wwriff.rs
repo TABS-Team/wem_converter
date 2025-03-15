@@ -1,11 +1,13 @@
 use std::fs::File;
 use std::path::Path;
 use std::io::{self, Read, Seek, BufReader, BufWriter, SeekFrom};
-use crate::errors::{ParseError, Result};
 use byteorder::{LittleEndian, BigEndian, ReadBytesExt};
+use tracing;
 
 use crate::bit_stream::{BitOggStream, BitOggStreamT, BitUint, BitUintV, BitStream};
 use crate::codebook::{ilog};
+use crate::errors::{ParseError, Result};
+
 
 
 // Helper functions.
@@ -464,44 +466,41 @@ impl WwiseRiffVorbis {
     }
 
     pub fn print_info(&self) {
-        if self.little_endian {
-            print!("RIFF WAVE");
-        } else {
-            print!("RIFX WAVE");
-        }
-        print!(" {} channel", self.channels);
-        if self.channels != 1 {
-            print!("s");
-        }
-        println!(" {} Hz {} bps", self.sample_rate, self.avg_bytes_per_second * 8);
-        println!("{} samples", self.sample_count);
+        let waveform = if self.little_endian { "RIFF WAVE" } else { "RIFX WAVE" };
+        tracing::trace!("{} {} channel{} {} Hz {} bps", 
+            waveform, 
+            self.channels, 
+            if self.channels != 1 { "s" } else { "" },
+            self.sample_rate,
+            self.avg_bytes_per_second * 8
+        );
         if self.loop_count != 0 {
-            println!("loop from {} to {}", self.loop_start, self.loop_end);
+            tracing::trace!("loop from {} to {}", self.loop_start, self.loop_end);
         }
         if self.old_packet_headers {
-            println!("- 8 byte (old) packet headers");
+            tracing::trace!("8 byte (old) packet headers");
         } else if self.no_granule {
-            println!("- 2 byte packet headers, no granule");
+            tracing::trace!("2 byte packet headers, no granule");
         } else {
-            println!("- 6 byte packet headers");
+            tracing::trace!("6 byte packet headers");
         }
         if self.header_triad_present {
-            println!("- Vorbis header triad present");
+            tracing::trace!("Vorbis header triad present");
         }
         if self.full_setup || self.header_triad_present {
-            println!("- full setup header");
+            tracing::trace!("full setup header");
         } else {
-            println!("- stripped setup header");
+            tracing::trace!("stripped setup header");
         }
         if self.inline_codebooks || self.header_triad_present {
-            println!("- inline codebooks");
+            tracing::trace!("inline codebooks");
         } else {
-            println!("- external codebooks ({})", self.codebooks_name);
+            tracing::trace!("external codebooks ({})", self.codebooks_name);
         }
         if self.mod_packets {
-            println!("- modified Vorbis packets");
+            tracing::trace!("modified Vorbis packets");
         } else {
-            println!("- standard Vorbis packets");
+            tracing::trace!("standard Vorbis packets");
         }
     }
 
