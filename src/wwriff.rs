@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::path::Path;
-use std::io::{self, Read, Seek, BufReader, BufWriter, SeekFrom};
+use std::io::{self, Read, Seek, BufReader, BufWriter, SeekFrom, Cursor};
 use byteorder::{LittleEndian, BigEndian, ReadBytesExt};
 use tracing;
 
@@ -143,10 +143,10 @@ impl VorbisPacketHeader {
 
 // -------------------- WwiseRiffVorbis -----------------------------------------
 #[derive(Debug)]
-pub struct WwiseRiffVorbis {
+pub struct WwiseRiffVorbis<R: Read + Seek> {
     pub file_name: String,
     pub codebooks_name: String,
-    pub infile: BufReader<File>,
+    pub infile: BufReader<R>,
     pub file_size: i64,
 
     pub little_endian: bool,
@@ -201,7 +201,7 @@ pub struct WwiseRiffVorbis {
     pub read_32: fn(&mut dyn Read) -> Result<u32>,
 }
 
-impl WwiseRiffVorbis {
+impl WwiseRiffVorbis<File>{
     pub fn new(
         name: &str,
         codebooks_name: &str,
@@ -464,6 +464,286 @@ impl WwiseRiffVorbis {
 
         Ok(instance)
     }
+}
+
+impl WwiseRiffVorbis<Cursor<Vec<u8>>>{
+    pub fn new(
+        buf: Cursor<Vec<u8>>,
+        file_name: &str,
+        codebooks_name: &str,
+        inline_codebooks: bool,
+        full_setup: bool,
+        force_packet_format: ForcePacketFormat,
+    ) -> Result<Self> {
+        let mut infile = BufReader::new(buf.clone());
+    
+        let mut instance = WwiseRiffVorbis {
+            // Since there is no file name, we use a placeholder.
+            file_name: file_name.to_string(),
+            codebooks_name: codebooks_name.to_string(),
+            infile,
+            file_size: -1,
+            little_endian: true,
+            riff_size: -1,
+            fmt_offset: -1,
+            cue_offset: -1,
+            list_offset: -1,
+            smpl_offset: -1,
+            vorb_offset: -1,
+            data_offset: -1,
+            fmt_size: -1,
+            cue_size: -1,
+            list_size: -1,
+            smpl_size: -1,
+            vorb_size: -1,
+            data_size: -1,
+            channels: 0,
+            sample_rate: 0,
+            avg_bytes_per_second: 0,
+            ext_unk: 0,
+            subtype: 0,
+            cue_count: 0,
+            loop_count: 0,
+            loop_start: 0,
+            loop_end: 0,
+            sample_count: 0,
+            setup_packet_offset: 0,
+            first_audio_packet_offset: 0,
+            uid: 0,
+            blocksize_0_pow: 0,
+            blocksize_1_pow: 0,
+            inline_codebooks,
+            full_setup,
+            header_triad_present: false,
+            old_packet_headers: false,
+            no_granule: false,
+            mod_packets: false,
+            // Start with the little-endian functions by default.
+            read_16: read_16_le_dyn,
+            read_32: read_32_le_dyn,
+        };
+    
+        // Set the file size from the length of the buffer.
+        instance.file_size = buf.get_ref().len() as i64;
+        if instance.file_size < 12 {
+            return Err(ParseError::Message("Buffer too small".to_string()));
+        }
+    
+        // Read RIFF header.
+        let mut riff_head = [0u8; 4];
+        instance.infile.seek(SeekFrom::Start(0))?;
+        instance.infile.read_exact(&mut riff_head)?;
+    
+        if &riff_head == b"RIFX" {
+            instance.little_endian = false;
+        } else if &riff_head == b"RIFF" {
+            instance.little_endian = true;
+        } else {
+            return Err(ParseError::Message("missing RIFF".to_string()));
+        }
+        instance.read_16 = if instance.little_endian { read_16_le_dyn } else { read_16_be_dyn };
+        instance.read_32 = if instance.little_endian { read_32_le_dyn } else { read_32_be_dyn };
+    
+        let read_32_fn = instance.read_32;
+        instance.riff_size = read_32_fn(&mut instance.infile)? as i64 + 8;
+        if instance.riff_size > instance.file_size {
+            return Err(ParseError::Message("RIFF truncated".to_string()));
+        }
+    
+        // Check the WAVE header.
+        let mut wave_head = [0u8; 4];
+        instance.infile.read_exact(&mut wave_head)?;
+        if &wave_head != b"WAVE" {
+            return Err(ParseError::Message("missing WAVE".to_string()));
+        }
+    
+        // Iterate through chunks.
+        let mut chunk_offset = 12;
+        while chunk_offset < instance.riff_size {
+            instance.infile.seek(SeekFrom::Start(chunk_offset as u64))?;
+            if chunk_offset + 8 > instance.riff_size {
+                return Err(ParseError::Message("chunk header truncated".to_string()));
+            }
+            let mut chunk_type = [0u8; 4];
+            instance.infile.read_exact(&mut chunk_type)?;
+            let chunk_size = read_32_fn(&mut instance.infile)? as i64;
+    
+            match &chunk_type {
+                b"fmt " => {
+                    instance.fmt_offset = chunk_offset + 8;
+                    instance.fmt_size = chunk_size;
+                },
+                b"cue " => {
+                    instance.cue_offset = chunk_offset + 8;
+                    instance.cue_size = chunk_size;
+                },
+                b"LIST" => {
+                    instance.list_offset = chunk_offset + 8;
+                    instance.list_size = chunk_size;
+                },
+                b"smpl" => {
+                    instance.smpl_offset = chunk_offset + 8;
+                    instance.smpl_size = chunk_size;
+                },
+                b"vorb" => {
+                    instance.vorb_offset = chunk_offset + 8;
+                    instance.vorb_size = chunk_size;
+                },
+                b"data" => {
+                    instance.data_offset = chunk_offset + 8;
+                    instance.data_size = chunk_size;
+                },
+                _ => { /* ignore unrecognized chunks */ }
+            }
+            chunk_offset += 8 + chunk_size;
+        }
+        if chunk_offset > instance.riff_size {
+            return Err(ParseError::Message("chunk truncated".to_string()));
+        }
+        if instance.fmt_offset == -1 || instance.data_offset == -1 {
+            return Err(ParseError::Message("expected fmt, data chunks".to_string()));
+        }
+    
+        // Parse the fmt chunk.
+        instance.infile.seek(SeekFrom::Start(instance.fmt_offset as u64))?;
+        if read_16_le(&mut instance.infile)? != 0xFFFF {
+            return Err(ParseError::Message("bad codec id".to_string()));
+        }
+        instance.channels = read_16_le(&mut instance.infile)?;
+        instance.sample_rate = read_32_le(&mut instance.infile)?;
+        instance.avg_bytes_per_second = read_32_le(&mut instance.infile)?;
+        if read_16_le(&mut instance.infile)? != 0 {
+            return Err(ParseError::Message("bad block align".to_string()));
+        }
+        if read_16_le(&mut instance.infile)? != 0 {
+            return Err(ParseError::Message("expected 0 bps".to_string()));
+        }
+        let extra_len = read_16_le(&mut instance.infile)?;
+        if (instance.fmt_size - 0x12) as u16 != extra_len {
+            return Err(ParseError::Message("bad extra fmt length".to_string()));
+        }
+        if instance.fmt_size - 0x12 >= 2 {
+            instance.ext_unk = read_16_le(&mut instance.infile)?;
+            if instance.fmt_size - 0x12 >= 6 {
+                instance.subtype = read_32_le(&mut instance.infile)?;
+            }
+        }
+        if instance.fmt_size == 0x28 {
+            let mut whoknowsbuf = [0u8; 16];
+            let whoknowsbuf_check: [u8; 16] =
+                [1, 0, 0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xAA, 0, 0x38, 0x9b, 0x71];
+            instance.infile.read_exact(&mut whoknowsbuf)?;
+            if whoknowsbuf != whoknowsbuf_check {
+                return Err(ParseError::Message("expected signature in extra fmt?".to_string()));
+            }
+        }
+    
+        // Parse cue chunk if present.
+        if instance.cue_offset != -1 {
+            instance.infile.seek(SeekFrom::Start(instance.cue_offset as u64))?;
+            instance.cue_count = read_32_le(&mut instance.infile)?;
+        }
+    
+        // Parse smpl chunk if present.
+        if instance.smpl_offset != -1 {
+            instance.infile.seek(SeekFrom::Start((instance.smpl_offset + 0x1C) as u64))?;
+            instance.loop_count = read_32_le(&mut instance.infile)?;
+            if instance.loop_count != 1 {
+                return Err(ParseError::Message("expected one loop".to_string()));
+            }
+            instance.infile.seek(SeekFrom::Start((instance.smpl_offset + 0x2C) as u64))?;
+            instance.loop_start = read_32_le(&mut instance.infile)?;
+            instance.loop_end = read_32_le(&mut instance.infile)?;
+        }
+    
+        // Handle vorb chunk.
+        if instance.vorb_offset == -1 {
+            if instance.fmt_size == 0x42 {
+                instance.vorb_offset = instance.fmt_offset + 0x18;
+            } else {
+                return Err(ParseError::Message("expected vorb chunk".to_string()));
+            }
+        }
+        match instance.vorb_size {
+            -1 | 0x28 | 0x2A | 0x2C | 0x32 | 0x34 => {
+                instance.infile.seek(SeekFrom::Start((instance.vorb_offset + 0x00) as u64))?;
+            },
+            _ => return Err(ParseError::Message("bad vorb size".to_string())),
+        }
+        instance.sample_count = read_32_le(&mut instance.infile)?;
+    
+        match instance.vorb_size {
+            -1 | 0x2A => {
+                instance.no_granule = true;
+                instance.infile.seek(SeekFrom::Start((instance.vorb_offset + 0x4) as u64))?;
+                let mod_signal = read_32_le(&mut instance.infile)?;
+                if mod_signal != 0x4A && mod_signal != 0x4B &&
+                   mod_signal != 0x69 && mod_signal != 0x70 {
+                    instance.mod_packets = true;
+                }
+                instance.infile.seek(SeekFrom::Start((instance.vorb_offset + 0x10) as u64))?;
+            },
+            _ => {
+                instance.infile.seek(SeekFrom::Start((instance.vorb_offset + 0x18) as u64))?;
+            }
+        }
+    
+        // Apply forced packet format.
+        match force_packet_format {
+            ForcePacketFormat::NoModPackets => instance.mod_packets = false,
+            ForcePacketFormat::ModPackets => instance.mod_packets = true,
+        }
+    
+        instance.setup_packet_offset = read_32_le(&mut instance.infile)?;
+        instance.first_audio_packet_offset = read_32_le(&mut instance.infile)?;
+    
+        match instance.vorb_size {
+            -1 | 0x2A => {
+                instance.infile.seek(SeekFrom::Start((instance.vorb_offset + 0x24) as u64))?;
+            },
+            0x32 | 0x34 => {
+                instance.infile.seek(SeekFrom::Start((instance.vorb_offset + 0x2C) as u64))?;
+            },
+            _ => {}
+        }
+    
+        match instance.vorb_size {
+            0x28 | 0x2C => {
+                instance.header_triad_present = true;
+                instance.old_packet_headers = true;
+            },
+            -1 | 0x2A | 0x32 | 0x34 => {
+                instance.uid = read_32_le(&mut instance.infile)?;
+                instance.blocksize_0_pow = instance.infile.read_u8()?;
+                instance.blocksize_1_pow = instance.infile.read_u8()?;
+            },
+            _ => {}
+        }
+    
+        if instance.loop_count != 0 {
+            if instance.loop_end == 0 {
+                instance.loop_end = instance.sample_count;
+            } else {
+                instance.loop_end += 1;
+            }
+            if instance.loop_start >= instance.sample_count ||
+               instance.loop_end > instance.sample_count ||
+               instance.loop_start > instance.loop_end {
+                return Err(ParseError::Message("loops out of range".to_string()));
+            }
+        }
+
+        match instance.subtype {
+            4 | 3 | 0x33 | 0x37 | 0x3b | 0x3f => { },
+            _ => { }
+        }
+    
+        Ok(instance)
+    }
+}
+
+
+impl<R: Read + Seek> WwiseRiffVorbis<R> {
 
     pub fn print_info(&self) {
         let waveform = if self.little_endian { "RIFF WAVE" } else { "RIFX WAVE" };

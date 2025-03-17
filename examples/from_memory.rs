@@ -1,10 +1,10 @@
 use wem_converter::wwriff::{WwiseRiffVorbis, ForcePacketFormat};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{layer::SubscriberExt, Registry};
-use std::fs::File;
+use std::fs;
+use std::io::Cursor;
 
 fn main() {
-
     let subscriber = Registry::default()
         .with(ErrorLayer::default())
         .with(tracing_subscriber::fmt::Layer::default());
@@ -13,8 +13,19 @@ fn main() {
 
     let input_wem = "input.wem";
     let codebooks_file = "bin/packed_codebooks.bin";
-    let mut vorbis = match WwiseRiffVorbis::<File>::new(
-        input_wem,
+
+    let buffer = match fs::read(input_wem) {
+        Ok(data) => Cursor::new(data),
+        Err(e) => {
+            eprintln!("Error reading input file {}: {:?}", input_wem, e);
+            return;
+        }
+    };
+
+
+    let mut vorbis = match WwiseRiffVorbis::<Cursor<Vec<u8>>>::new(
+        buffer,
+        "input.ogg",
         codebooks_file,
         false,
         false,
@@ -26,6 +37,7 @@ fn main() {
             return;
         }
     };
+
     vorbis.print_info();
     if let Err(e) = vorbis.generate_ogg() {
         eprintln!("Error generating OGG file: {:?}", e);
